@@ -1,12 +1,16 @@
+#![feature(mpmc_channel)]
+
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::Arc;
 use std::thread::{self};
 use std::process::ExitCode;
 use std::ops::Not;
 use std::io::{self, Cursor, Read};
 use std::fs::File;
-use std::collections::{BTreeMap, BTreeSet, LinkedList};
-use std::time::Duration;
+use std::collections::{BTreeSet};
+use std::time::{Duration, Instant};
+
+use std::sync::mpmc;
 
 use tracing::{field, info_span};
 use tracing_subscriber::fmt::format::FmtSpan;
@@ -25,107 +29,102 @@ fn main() -> ExitCode {
 
         let file = File::open(filename).unwrap();
 
-        let buffer_size = 1 << 22;
+        let buffer_size = 1 << 21;
 
         let mut batches = Batches::with_buffer_size(file, buffer_size);
 
-        let batch_queue: Arc<Mutex<LinkedList<Vec<u8>>>>  = Arc::new(Mutex::new(LinkedList::new()));
-        let table_queue: Arc<Mutex<LinkedList<StatsMap>>>  = Arc::new(Mutex::new(LinkedList::new()));
-        let condvar = Arc::new(Condvar::new());
-        let table_queue_condvar = Arc::new(Condvar::new());
         let worker_count = 6;
         let producer_done = Arc::new(AtomicBool::new(false));
         let working = Arc::new(AtomicUsize::new(worker_count));
 
         let mut workers = Vec::new();
 
+        let (batch_sender, batch_receiver) = mpmc::channel::<Vec<u8>>();
+        let (table_sender, table_receiver) = mpmc::channel::<StatsMap>();
+
         for worker_index in 0..worker_count {
-            let batch_queue = Arc::clone(&batch_queue);
-            let table_queue = Arc::clone(&table_queue);
-            let condvar = Arc::clone(&condvar);
-            let table_queue_condvar = Arc::clone(&table_queue_condvar);
             let producer_done = Arc::clone(&producer_done);
             let working = Arc::clone(&working);
+            let batch_receiver = batch_receiver.clone();
+            let table_sender = table_sender.clone();
             let consumer_worker = thread::spawn(move || {
 
                 let mut batch_count = 0;
-                let _span = info_span!("worker", i=worker_index, batch_count=field::Empty);
+                let mut wait_time = Duration::ZERO;
+                let mut processing_time = Duration::ZERO;
+                let _span = info_span!("worker",
+                    i=worker_index,
+                    wait_time=field::Empty,
+                    processing_time=field::Empty,
+                    batch_count=field::Empty,
+                    time_per_batch=field::Empty);
 
                 while ! producer_done.load(Ordering::Relaxed) {
-                    let batch = {
-                        let guard = batch_queue.lock().unwrap();
-                        let mut queue = condvar.wait(guard).unwrap();
-                        queue.pop_front()
-                    };
+                    let start = Instant::now();
+                    let batch_result = batch_receiver.recv().ok();
+                    wait_time += start.elapsed();
 
-                    if let Some(batch) = batch {
+                    if let Some(batch) = batch_result {
                         batch_count += 1;
+                        let start = Instant::now();
                         let table = process_batch(batch.as_slice());
-                        {
-                            let mut table_queue = table_queue.lock().unwrap();
-                            table_queue.push_back(table);
-                            table_queue_condvar.notify_one();
-                        }
+                        processing_time += start.elapsed();
+                        table_sender.send(table).unwrap();
                     }
                 }
 
+                let time_per_batch = processing_time / batch_count;
+                _span.record("wait_time", format!("{:.1?}", wait_time));
+                _span.record("processing_time", format!("{:.1?}", processing_time));
+                _span.record("time_per_batch", format!("{:.1?}", time_per_batch));
                 _span.record("batch_count", batch_count);
 
                 working.fetch_sub(1, Ordering::Relaxed);
-                table_queue_condvar.notify_one();
-
             });
             workers.push(consumer_worker);
         }
 
         let merge_worker = thread::spawn(move || {
-            let _span = info_span!("merge_worker", max_queue_size=field::Empty);
-            let mut max_queue_size = 0;
+            let _span = info_span!("merge_worker", wait_duration=field::Empty);
+            let mut wait_duration = Duration::ZERO;
             let result = loop {
-                let to_merge = {
-                    let guard = table_queue.lock().unwrap();
-                    let (mut table_queue, _) = table_queue_condvar.wait_timeout_while(guard, Duration::from_millis(10), |q| q.len() < 2).unwrap();
-                    max_queue_size = max_queue_size.max(table_queue.len());
 
-                    let workers_running = working.load(Ordering::Relaxed) > 0;
+                let start = Instant::now();
+                let first = table_receiver.recv().unwrap();
+                wait_duration += start.elapsed();
 
-                    if table_queue.len() > 2 {
-                        let t1 = table_queue.pop_front().unwrap();
-                        let t2 = table_queue.pop_front().unwrap();
-                        Some((t1, t2))
-                    } else if workers_running {
-                        None
+                let second = loop {
+                    if working.load(Ordering::Relaxed) > 0 {
+
+                        let start = Instant::now();
+                        let second = table_receiver.recv_timeout(Duration::from_millis(10)).ok();
+                        wait_duration += start.elapsed();
+
+                        if second.is_some() { break second }
                     } else {
-                        break table_queue.pop_front().unwrap()
+                        break None
                     }
                 };
 
-                if let Some((table1, table2)) = to_merge {
-                    let merged = table1.merge(table2);
-                    let mut table_queue = table_queue.lock().unwrap();
-                    table_queue.push_back(merged);
+                if let Some(second) = second {
+                    let merged = first.merge(second);
+                    table_sender.send(merged).unwrap();
+                } else {
+                    break first
                 };
             };
-            _span.record("max_queue_size", max_queue_size);
+            _span.record("wait_duration", format!("{:?}", wait_duration));
             result
         });
 
         {
-            let mut max_queue_size = 0;
             let mut total_batches = 0;
-            let _enter = info_span!("producer", max_queue_size = field::Empty, total_batches=field::Empty);
+            let _enter = info_span!("producer", total_batches=field::Empty);
             while let Some(Ok(batch)) = batches.next() {
                 total_batches += 1;
-                {
-                    let mut batch_queue = batch_queue.lock().unwrap();
-                    batch_queue.push_back(batch);
-                    max_queue_size = max_queue_size.max(batch_queue.len());
-                }
-                condvar.notify_one();
+                batch_sender.send(batch).unwrap();
             }
             producer_done.store(true, Ordering::Relaxed);
-            condvar.notify_all();
-            _enter.record("max_queue_size", max_queue_size);
             _enter.record("total_batches", total_batches);
         }
 
@@ -134,9 +133,13 @@ fn main() -> ExitCode {
         }
 
         let final_table = merge_worker.join().unwrap();
-        for (key, stats) in final_table.iter() {
-            let name = String::from_utf8(key.to_owned()).unwrap();
-            println!("{} {:.2} {:.2} {:.2}", name, stats.min, stats.mean(), stats.max);
+
+        {
+            let _enter = info_span!("print");
+            for (key, stats) in final_table.iter() {
+                let name = String::from_utf8(key.to_owned()).unwrap();
+                println!("{} {:.2} {:.2} {:.2}", name, stats.min, stats.mean(), stats.max);
+            }
         }
 
         ExitCode::SUCCESS
@@ -250,55 +253,6 @@ impl SummaryStat {
     }
 }
 
-pub struct EntryCollection {
-    //pub entries: Vec<(Vec<u8>, SummaryStat)>,
-    //pub entrie_table: HashMap<Vec<u8>, SummaryStat>,
-    //pub entry_table: Vec<Option<HashMap<Vec<u8>, SummaryStat>>>,
-    pub entry_table: Vec<Option<BTreeMap<Vec<u8>, SummaryStat>>>,
-}
-
-impl EntryCollection {
-    pub fn new() -> EntryCollection {
-        //EntryCollection { entries: Vec::new() }
-        //EntryCollection { entries: HashMap::new() }
-        let mut entry_table = Vec::new();
-        for _ in 0..255 { entry_table.push(None) }
-        EntryCollection { entry_table }
-    }
-
-    pub fn add(&mut self, new_entry: Entry<&[u8]>) {
-        let i = new_entry.0[0] as usize;
-        let entries = match &mut self.entry_table[i] {
-            Some(map) => map,
-            None => {
-                self.entry_table[i] = Some(BTreeMap::new());
-                self.entry_table[i].as_mut().unwrap()
-            }
-        };
-        if ! entries.contains_key(new_entry.0) {
-            entries.insert(new_entry.0.to_owned(), SummaryStat::new());
-        }
-        entries.get_mut(new_entry.0).unwrap().add(new_entry.1)
-
-
-
-        //if ! self.entries.contains_key(new_entry.0) {
-        //    self.entries.insert(new_entry.0.to_owned(), SummaryStat::new());
-        //}
-        //self.entries.get_mut(new_entry.0).unwrap().add(new_entry.1)
-
-        //for entry in self.entries.iter_mut() {
-        //    if entry.0 == new_entry.0 {
-        //        entry.1.add(new_entry.1);
-        //        return;
-        //    }
-        //}
-        //let mut stat = SummaryStat::new();
-        //stat.add(new_entry.1);
-        //self.entries.push((new_entry.0.to_owned(), stat))
-    }
-}
-
 pub struct StatsMap {
     pub table: Vec<Vec<(Vec<u8>, SummaryStat)>>,
     pub max_size: usize,
@@ -308,8 +262,6 @@ pub struct StatsMap {
 impl StatsMap {
     pub fn new() -> StatsMap {
         let table = vec![Vec::with_capacity(16); 256 * 256];
-        //let mut table = Vec::new();
-        //(0..256 * 256).for_each(|_| table.push(Vec::with_capacity(16)));
         StatsMap { table, max_size: 0, occupied: BTreeSet::new() }
     }
 
@@ -376,9 +328,6 @@ type Entry<K> = (K, f32);
 pub fn entry_from_bytes(bytes: &[u8]) -> Result<Entry<&[u8]>, &'static str> {
     if let Some(separator_index) = bytes.iter().position(|&c| c == b';') {
         let (name, value_data) = bytes.split_at(separator_index);
-        //let value_data = &value_data[1..value_data.len()-1];
-        //let value_text = String::from_utf8(value_data.to_owned()).map_err(|_e| "invalid entry: from_utf8 error")?;
-        //let value: f32 = value_text.parse().map_err(|_e| "invalid entry: parse error")?;
         let value = parse_float(&value_data[1..value_data.len()]);
         Ok((name, value))
     } else {
@@ -469,15 +418,6 @@ mod test {
         let batch = b"abc;1.0\nxyz;2.0\n";
         let entries: Vec<Entry<&[u8]>> = batch.split(|&c| c == b'\n').filter(|e| !e.is_empty()).map(entry_from_bytes).map(|r| r.unwrap()).collect();
         assert_eq!(entries, vec![(&b"abc"[..], 1.0), (b"xyz", 2.0)]);
-    }
-
-    #[test]
-    pub fn entry_collection() {
-        // let mut collection = EntryCollection::new();
-        // collection.add((b"a", -1.0));
-        // collection.add((b"a", 1.0));
-        // dbg!(collection.entries);
-        // assert!(1 == 0);
     }
 
     #[test]
